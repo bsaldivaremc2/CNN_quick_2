@@ -7,7 +7,7 @@ import pandas as pd
 import sys
 import imp
 
-def predict_model(iX,model_dir=None):
+def predict_model(iX,model_dir=None,opt_mode='classification'):
     if model_dir==None:
         print("No model to load")
         return
@@ -17,12 +17,19 @@ def predict_model(iX,model_dir=None):
             with s.graph.as_default():
                 saver = tf.train.import_meta_graph(save_dir+".meta")
                 saver.restore(s,save_dir)
+                dop_dic = {}
+                for x in tf.get_default_graph().get_operations():
+                    if x.type == 'Placeholder':
+                        if "drop_out" in x.name:
+                            dop_dic[x.name+":0"]=1.0
                 fd={'x:0':iX,'train_test:0':False}
-                score,c = s.run(['Softmax:0','ClassPred:0'],feed_dict=fd)
-                print("Score",score)
-                print("Class:",c)
-    return score,c
-def test_model(iX,iY,model_dir=None):
+                fd.update(dop_dic)
+                if opt_mode=='classification':
+                    score,c = s.run(['Softmax:0','ClassPred:0'],feed_dict=fd)
+                    return score,c
+
+
+def test_model(iX,iY,model_dir=None,opt_mode='classification'):
     if model_dir==None:
         print("No model to load")
         return
@@ -32,12 +39,22 @@ def test_model(iX,iY,model_dir=None):
             with s.graph.as_default():
                 saver = tf.train.import_meta_graph(save_dir+".meta")
                 saver.restore(s,save_dir)
+                dop_dic = {}
+                for x in tf.get_default_graph().get_operations():
+                    if x.type == 'Placeholder':
+                        if "drop_out" in x.name:
+                            dop_dic[x.name+":0"]=1.0
                 fd={'x:0':iX,'y:0':iY,'train_test:0':False}
-                lt,spe,sen,acc= s.run(['cross_entropy:0','spe:0','sen:0','acc:0'],feed_dict=fd)
-                spe=np.round(spe,2)
-                acc=np.round(acc,2)
-                sen=np.round(sen,2)
-                print("Cross entropy",lt,"Specificity",spe,"Sensitivity",sen,"Accuracy",acc)
+                fd.update(dop_dic)
+                if opt_mode=='classification':
+                    lt,spe,sen,acc= s.run(['loss:0','spe:0','sen:0','acc:0'],feed_dict=fd)
+                    spe=np.round(spe,2)
+                    acc=np.round(acc,2)
+                    sen=np.round(sen,2)
+                    print("Cross entropy",lt,"Specificity",spe,"Sensitivity",sen,"Accuracy",acc)
+                elif opt_mode=='regression':
+                    lt= s.run('loss:0',feed_dict=fd)
+                    print("Loss",lt)
 
 def print_progres_train(ix,it,bx,bt,lt):
     iter_str = "Iter:"+str(ix)+"/"+str(it)
@@ -45,10 +62,15 @@ def print_progres_train(ix,it,bx,bt,lt):
     loss_str = "Loss,Tr:"+str(lt)
     print(iter_str,batch_str,loss_str)
 
+
+
 def print_progres_test(ix,it,bx,bt,spex,senx,accx,lt,ls):
     iter_str = "Iter:"+str(ix)+"/"+str(it)
     batch_str = "Batch:"+str(bx)+"/"+str(bt)
     loss_str = "Loss,Tr:"+str(lt)+" Ts:"+str(ls)
+    spex=np.round(spex,2)
+    accx=np.round(accx,2)
+    senx=np.round(senx,2)
     perf_str = 'Spec:'+str(spex)+" Sens:"+str(senx)+" Acc:"+str(accx)
     print(iter_str,batch_str,loss_str,perf_str)
 
@@ -56,7 +78,7 @@ def print_progres_test(ix,it,bx,bt,spex,senx,accx,lt,ls):
 def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_n=0.1,
                 iters=10,lr=0.001,lrdf=None,lrdr=10,
                 batch_size=32,
-                restore=False,save=False,model_name=None
+                restore=False,save=False,model_name=None,opt_mode='classification'
                ):
     
     tf.reset_default_graph()
@@ -72,28 +94,37 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
     learning_rate = tf.placeholder(tf.float32)
     
     cl= [xi]
+    dropout_phd = {}
     for _ in cv_args:
         _['is_training']=train_bool
+        if 'drop_out_bool' in _.keys():
+            if _['drop_out_bool']==True:
+                with tf.name_scope('drop_out'):
+                    _['drop_out_ph']=tf.placeholder(tf.float32,name='do_ph_'+_['name_scope'])
+                dropout_phd[_['drop_out_ph']]=_['drop_out_v']
     cl.extend(cv_args)
     last_cv = multi_conv(cl)
     fcl = [last_cv]
     for _ in fc_args:
         _['is_training']=train_bool
+        if 'drop_out_bool' in _.keys():
+            if _['drop_out_bool']==True:
+                with tf.name_scope('drop_out'):
+                    _['drop_out_ph']=tf.placeholder(tf.float32,name='do_ph_'+_['name_scope'])
+                dropout_phd[_['drop_out_ph']]=_['drop_out_v']
     fcl.extend(fc_args)
     last_mlp = multi_mlp(fcl)
     
-    FCL_input = last_mlp
-    FCL_input_features = get_previous_features(FCL_input)
-    W_FCL = tf.Variable(tf.truncated_normal([FCL_input_features, class_output], stddev=stddev_n))
-    b_FCL = tf.Variable(tf.constant(stddev_n, shape=[class_output])) 
-    FCL=tf.matmul(FCL_input, W_FCL) + b_FCL
-    y_CNN = tf.nn.softmax(FCL,name='Softmax')
-    class_pred = tf.argmax(y_CNN,1,name='ClassPred')
-    
-    cross_entropy = tf.reduce_mean(-tf.reduce_sum(y_ * tf.log(y_CNN), reduction_indices=[1]),name="cross_entropy")
-    train_step = tf.train.AdamOptimizer(learning_rate).minimize(cross_entropy)
-    acc_,spe_,sen_,tp_,tn_,fp_,fn_ = stats_class(y_CNN,y_)
-    
+    FCL = last_mlp
+
+    if opt_mode=='classification':
+        y_CNN = tf.nn.softmax(FCL,name='Softmax')
+        class_pred = tf.argmax(y_CNN,1,name='ClassPred')
+        loss = tf.reduce_mean(-tf.reduce_sum(y_ * tf.log(y_CNN), reduction_indices=[1]),name="loss")
+        acc_,spe_,sen_,tp_,tn_,fp_,fn_ = stats_class(y_CNN,y_)
+    elif opt_mode=='regression':
+        loss = tf.losses.mean_squared_error(y_,FCL)
+    train_step = tf.train.AdamOptimizer(learning_rate).minimize(loss)    
     init_op = tf.global_variables_initializer()
     saver = tf.train.Saver()
     
@@ -124,15 +155,18 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
                 xtb = ix[_b:_b+batch_size,:]
                 ytb = iy[_b:_b+batch_size,:]
                 fd = {xi:xtb,y_:ytb,learning_rate:lr,train_bool:True}
-                l,t= s.run([cross_entropy,train_step,],feed_dict=fd)
+                fd.update(dropout_phd)
+                l,t= s.run([loss,train_step,],feed_dict=fd)
                 
                 if batch_test==True:
                     fd={xi:itx,y_:ity,learning_rate:lr,train_bool:False}
-                    lt,spe,sen,acc= s.run([cross_entropy,spe_,sen_,acc_],feed_dict=fd)
-                    spe=np.round(spe,2)
-                    acc=np.round(acc,2)
-                    sen=np.round(sen,2)
-                    print_progres_test(_,iters,_b,batches,spe,sen,acc,l,lt)
+                    fd.update(dropout_phd)
+                    if opt_mode=='classification':
+                        lt,spe,sen,acc= s.run([loss,spe_,sen_,acc_],feed_dict=fd)
+                        print_progres_test(_,iters,_b,batches,spe,sen,acc,l,lt)
+                    elif opt_mode=='regression':
+                        lt= s.run([loss],feed_dict=fd)
+                        print("Loss:",lt)
                 else:
                     print_progres_train(_,iters,_b,batches,l)
             bb =_b*batches
@@ -140,14 +174,17 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
                 xtb = ix[_b+batch_size:rows,:]
                 ytb = iy[_b+batch_size:rows,:]
                 fd = {xi:xtb,y_:ytb,learning_rate:lr,train_bool:True}
-                l,t= s.run([cross_entropy,train_step],feed_dict=fd)
+                fd.update(dropout_phd)
+                l,t= s.run([loss,train_step],feed_dict=fd)
                 if batch_test==True:
                     fd={xi:itx,y_:ity,learning_rate:lr,train_bool:False}
-                    lt,spe,sen,acc= s.run([cross_entropy,spe_,sen_,acc_],feed_dict=fd)
-                    spe=np.round(spe,2)
-                    acc=np.round(acc,2)
-                    sen=np.round(sen,2)
-                    print_progres_test(_,iters,_b,batches,spe,sen,acc,l,lt)
+                    fd.update(dropout_phd)
+                    if opt_mode=='classification':
+                        lt,spe,sen,acc= s.run([loss,spe_,sen_,acc_],feed_dict=fd)
+                        print_progres_test(_,iters,_b,batches,spe,sen,acc,l,lt)
+                    elif opt_mode=='regression':
+                        lt= s.run([loss],feed_dict=fd)
+                        print("Loss:",lt)
                 else:
                     print_progres_train(_,iters,_b,batches,l)
         if save_model==True:
@@ -178,7 +215,8 @@ def conv(input_matrix,filter_size=3,layer_depth=8,
               strides=[1,1,1,1],padding='SAME',
               is_training=True,name_scope="lx",
               stddev_n = 0.05,
-             max_bool=False,max_kernel=[1,2,2,1],max_strides=[1,1,1,1], max_padding='SAME'
+             max_bool=False,max_kernel=[1,2,2,1],max_strides=[1,1,1,1], max_padding='SAME',
+             drop_out_bool=False,drop_out_ph=None,drop_out_v=None
              ):
     with tf.name_scope(name_scope):
         input_depth=input_matrix.get_shape().as_list()[3]
@@ -188,14 +226,19 @@ def conv(input_matrix,filter_size=3,layer_depth=8,
         n = tf.contrib.layers.batch_norm(c, center=True, scale=True, is_training=is_training)
         a = tf.nn.relu(n,name="activation")
         if max_bool==True:
-            return tf.nn.max_pool(a, ksize=max_kernel,strides=max_strides, padding=max_padding,name='max')
+            out = tf.nn.max_pool(a, ksize=max_kernel,strides=max_strides, padding=max_padding,name='max')
         else:
-            return a
+            out = a
+        if drop_out_bool==True:
+            out_  = tf.nn.dropout(out, drop_out_ph)
+        else:
+            out_ = out
+        return out_
 
 
 def fc(input_matrix,n=22,norm=False,prev_conv=False,
        stddev_n = 0.05,is_training=True,
-       name_scope='FC'):
+       name_scope='FC',drop_out_bool=False,drop_out_ph=None,drop_out_v=None):
     with tf.name_scope(name_scope):
         cvpfx = get_previous_features(input_matrix)
         if prev_conv==True:
@@ -207,9 +250,14 @@ def fc(input_matrix,n=22,norm=False,prev_conv=False,
         fc = tf.matmul(im, W) + b
         if norm==True:
             n = tf.contrib.layers.batch_norm(fc, center=True, scale=True, is_training=is_training)
-            return tf.nn.relu(n,name="activation")
+            out = tf.nn.relu(n,name="activation")
         else:
-            return tf.nn.relu(fc,name="activation")
+            out = tf.nn.relu(fc,name="activation")
+        if drop_out_bool==True:
+            out_  = tf.nn.dropout(out, drop_out_ph)
+        else:
+            out_ = out
+        return out_
 
 
 def stats_class(predicted,ground_truth):
