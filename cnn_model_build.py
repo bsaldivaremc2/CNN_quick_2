@@ -6,6 +6,9 @@ import os
 import pandas as pd
 import sys
 import imp
+import smtplib
+import socket
+from time import time
 
 def predict_model(iX,model_dir=None,opt_mode='classification'):
     if model_dir==None:
@@ -29,11 +32,15 @@ def predict_model(iX,model_dir=None,opt_mode='classification'):
                     return score,c
 
 
-def test_model(iX,iY,model_dir=None,opt_mode='classification'):
+def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn','loss','spe','sen','acc']):
     if model_dir==None:
         print("No model to load")
         return
     else:
+        stats_l = []
+        for _ in stats_list:
+            stats_l.append(_+":0")
+        return_dic ={}
         save_dir=model_dir
         with tf.Session('', tf.Graph()) as s:
             with s.graph.as_default():
@@ -47,14 +54,16 @@ def test_model(iX,iY,model_dir=None,opt_mode='classification'):
                 fd={'x:0':iX,'y:0':iY,'train_test:0':False}
                 fd.update(dop_dic)
                 if opt_mode=='classification':
-                    lt,spe,sen,acc= s.run(['loss:0','spe:0','sen:0','acc:0'],feed_dict=fd)
-                    spe=np.round(spe,2)
-                    acc=np.round(acc,2)
-                    sen=np.round(sen,2)
-                    print("Cross entropy",lt,"Specificity",spe,"Sensitivity",sen,"Accuracy",acc)
+                    stats_result = s.run(stats_l,feed_dict=fd)
+                    print_s=""
+                    for _,sr in enumerate(stats_result):
+                        print_s += stats_list[_]+":"+str(sr)+" "
+                        return_dic[stats_list[_]]=sr
+                    print(print_s)
                 elif opt_mode=='regression':
                     lt= s.run('loss:0',feed_dict=fd)
                     print("Loss",lt)
+        return return_dic
 
 def print_progres_train(ix,it,bx,bt,lt):
     iter_str = "Iter:"+str(ix)+"/"+str(it)
@@ -78,7 +87,7 @@ def print_progres_test(ix,it,bx,bt,spex,senx,accx,lt,ls):
 def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_n=0.1,
                 iters=10,lr=0.001,lrdf=None,lrdr=10,
                 batch_size=32,
-                restore=False,save=False,model_name=None,opt_mode='classification'
+                restore=False,save=False,save_name=None,restore_name=None,opt_mode='classification'
                ):
     
     tf.reset_default_graph()
@@ -95,18 +104,23 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
     
     cl= [xi]
     dropout_phd = {}
-    for _ in cv_args:
+    for _i,_ in enumerate(cv_args):
         _['is_training']=train_bool
+        if not 'name_scope' in _.keys():
+            _['name_scope']='C'+str(_i)
         if 'drop_out_bool' in _.keys():
             if _['drop_out_bool']==True:
                 with tf.name_scope('drop_out'):
                     _['drop_out_ph']=tf.placeholder(tf.float32,name='do_ph_'+_['name_scope'])
                 dropout_phd[_['drop_out_ph']]=_['drop_out_v']
+
     cl.extend(cv_args)
     last_cv = multi_conv(cl)
     fcl = [last_cv]
-    for _ in fc_args:
+    for _i,_ in enumerate(fc_args):
         _['is_training']=train_bool
+        if not 'name_scope' in _.keys():
+            _['name_scope']='FC'+str(_i)
         if 'drop_out_bool' in _.keys():
             if _['drop_out_bool']==True:
                 with tf.name_scope('drop_out'):
@@ -131,18 +145,19 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
     
     save_model=save
     restore_model = restore
-    save_dir=model_name
+    save_dir=save_name
+    restore_dir=restore_name
     
     rows = d0
     batches = rows//batch_size
     
     with tf.Session() as s:
         if restore_model==True:
-            if model_name==None:
+            if restore_name==None:
                 print("No model file specified")
                 return
             else:
-                saver.restore(s,save_dir)
+                saver.restore(s,restore_dir)
         else:
             s.run(init_op)
     
@@ -188,7 +203,7 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
                 else:
                     print_progres_train(_,iters,_b,batches,l)
         if save_model==True:
-            if model_name==None:
+            if save_name==None:
                 print("No model specified, model not being saved")
                 return
             else:
@@ -276,6 +291,12 @@ def stats_class(predicted,ground_truth):
     accuracy = tf.divide((tn+tp),(tn+tp+fn+fp),name='acc')#accuracy = (tn+tp)/(tn+tp+fn+fp)
     return [accuracy,specificity,sensitivity,tp,tn,fp,fn]
 
+def acc_sen_spe(tp,tn,fp,fn):
+    stats_dic={}
+    stats_dic['sen']=(tp/(tp+fn))
+    stats_dic['acc']=(tn+tp)/(tp+tn+fp+fn)
+    stats_dic['spe']=tn/(tn+tp)
+    return stats_dic.copy()
 
 def get_previous_features(i_layer):
     convx_dims = i_layer.get_shape().as_list()
@@ -285,4 +306,40 @@ def get_previous_features(i_layer):
     return output_features
 
 
+def send_mail(email_origin,email_destination,email_pass,subject="Test report",content="Test"):
+    server = smtplib.SMTP('smtp.gmail.com:587')
+    server.starttls()
+    #Next, log in to the server
+    server.login(email_origin,email_pass)
+    msg = "Subject:"+subject+" \n\n "+content+"\n" # The /n separates the message from the headers
+    server.sendmail(email_origin,email_destination, msg)
 
+def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn']):
+    xts = iX.shape[0]
+    bs = xts//batch_size
+    stats_l = []
+    for _ in range(0,bs):
+        print(str(_)+"/"+str(bs))
+        bb = _*batch_size
+        bb1 = (1+_)*batch_size
+        bx = iX[bb:bb1,:,:,:]
+        by = iY[bb:bb1,:]
+        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list)
+        stats_l.append(stats_dic)
+    if bs*batch_size<xts:
+        print(str(_+1)+"/"+str(bs))
+        bb = (1+_)*batch_size
+        bb1 = xts
+        bx = iX[bb:bb1,:,:,:]
+        by = iY[bb:bb1,:]
+        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list)
+        stats_l.append(stats_dic)
+    stats_df = pd.DataFrame(stats_l)
+    stats_dic = stats_df.sum().to_dict()
+    ac_se_sp = acc_sen_spe(**stats_dic)
+
+    stats_dic.update(ac_se_sp)
+    return stats_dic
+
+
+    
