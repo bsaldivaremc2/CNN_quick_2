@@ -30,6 +30,11 @@ def predict_model(iX,model_dir=None,opt_mode='classification'):
                 if opt_mode=='classification':
                     score,c = s.run(['Softmax:0','ClassPred:0'],feed_dict=fd)
                     return score,c
+                elif opt_mode=='regression':
+                    fcl = s.run('FCL/FC:0',feed_dict=fd)
+                    return fcl
+
+
 
 
 def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn','loss','spe','sen','acc']):
@@ -121,6 +126,8 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
         _['is_training']=train_bool
         if not 'name_scope' in _.keys():
             _['name_scope']='FC'+str(_i)
+        if _i==len(fc_args)-1:
+            _['name_scope']='FCL'
         if 'drop_out_bool' in _.keys():
             if _['drop_out_bool']==True:
                 with tf.name_scope('drop_out'):
@@ -137,7 +144,7 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
         loss = tf.reduce_mean(-tf.reduce_sum(y_ * tf.log(y_CNN), reduction_indices=[1]),name="loss")
         acc_,spe_,sen_,tp_,tn_,fp_,fn_ = stats_class(y_CNN,y_)
     elif opt_mode=='regression':
-        loss = tf.losses.mean_squared_error(y_,FCL)
+        loss = tf.reduce_mean(tf.pow(tf.subtract(y_,FCL),2),name='loss')
     train_step = tf.train.AdamOptimizer(learning_rate).minimize(loss)    
     init_op = tf.global_variables_initializer()
     saver = tf.train.Saver()
@@ -262,16 +269,19 @@ def fc(input_matrix,n=22,norm=False,prev_conv=False,
             im = input_matrix
         W = tf.Variable(tf.truncated_normal([cvpfx, n], stddev=stddev_n),name='W')
         b = tf.Variable(tf.constant(stddev_n, shape=[n]),name='b') 
-        fc = tf.matmul(im, W) + b
-        if norm==True:
-            n = tf.contrib.layers.batch_norm(fc, center=True, scale=True, is_training=is_training)
-            out = tf.nn.relu(n,name="activation")
+        fc = tf.add(tf.matmul(im, W),b,name="FC")
+        if name_scope=="FCL":
+            out_ = fc
         else:
-            out = tf.nn.relu(fc,name="activation")
-        if drop_out_bool==True:
-            out_  = tf.nn.dropout(out, drop_out_ph)
-        else:
-            out_ = out
+            if norm==True:
+                n = tf.contrib.layers.batch_norm(fc, center=True, scale=True, is_training=is_training)
+                out = tf.nn.relu(n,name="activation")
+            else:
+                out = tf.nn.relu(fc,name="activation")
+            if drop_out_bool==True:
+                out_  = tf.nn.dropout(out, drop_out_ph)
+            else:
+                out_ = out
         return out_
 
 
@@ -336,10 +346,45 @@ def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classificat
         stats_l.append(stats_dic)
     stats_df = pd.DataFrame(stats_l)
     stats_dic = stats_df.sum().to_dict()
-    ac_se_sp = acc_sen_spe(**stats_dic)
+    if opt_mode=='classification':
+        ac_se_sp = acc_sen_spe(**stats_dic)
+        stats_dic.update(ac_se_sp)
 
-    stats_dic.update(ac_se_sp)
     return stats_dic
 
+def binary_balance_positive_negative(iNp,iBatchSize=256,v=False,reshape_x=(256,256,1)):
+    negative_examples = iNp[iNp[:,-1]==0]
+    positive_examples = iNp[iNp[:,-1]==1]
+    mini_batch_size_half = iBatchSize//2
+    negative_examples_m = negative_examples.shape[0]
+    positive_examples_m = positive_examples.shape[0]
+    positive_batches = positive_examples_m//mini_batch_size_half
+    positive_batch_residual = positive_examples_m%mini_batch_size_half
+    negative_batches = negative_examples_m//mini_batch_size_half
+    negative_batch_residual = negative_examples_m%mini_batch_size_half
+    balanced_batches = min(positive_batches,negative_batches)
 
-    
+    batch_list = []
+    for batch in range(0,balanced_batches):
+        start_batch = batch*mini_batch_size_half
+        end_batch = (batch+1)*mini_batch_size_half
+        _ = np.concatenate((positive_examples[start_batch:end_batch,:],negative_examples[start_batch:end_batch,:]),0)
+        xTemp = (_[:,:-1]).astype('float32')
+        xTemp=xTemp/255.0
+        yTemp = _[:,-1]
+        yt = pd.get_dummies(yTemp).values
+        if batch==0:
+            x_o = xTemp
+            y_o = yt
+        else:
+            x_o = np.concatenate([x_o,xTemp],0)
+            y_o = np.concatenate([y_o,yt],0)
+    if v==True:
+        print("Pos batches",positive_batches,"Pos res",positive_batch_residual)
+        print("Neg batches",negative_batches,"Neg res",negative_batch_residual)
+        print("Selected batches number",balanced_batches)
+    x_o = reshape_npconv(x_o,reshape_x)
+    return x_o,y_o
+
+def reshape_npconv(iX,reshape_x=(256,256,1)):
+    return iX.reshape(iX.shape[0],reshape_x[0],reshape_x[1],reshape_x[2])
