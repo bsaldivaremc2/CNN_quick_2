@@ -10,7 +10,7 @@ import smtplib
 import socket
 from time import time
 
-def predict_model(iX,model_dir=None,opt_mode='classification'):
+def predict_model(iX,model_dir=None,opt_mode='classification',is_training=False):
     if model_dir==None:
         print("No model to load")
         return
@@ -25,7 +25,7 @@ def predict_model(iX,model_dir=None,opt_mode='classification'):
                     if x.type == 'Placeholder':
                         if "drop_out" in x.name:
                             dop_dic[x.name+":0"]=1.0
-                fd={'x:0':iX,'train_test:0':False}
+                fd={'x:0':iX,'train_test:0':is_training}
                 fd.update(dop_dic)
                 if opt_mode=='classification':
                     score,c = s.run(['Softmax:0','ClassPred:0'],feed_dict=fd)
@@ -35,9 +35,7 @@ def predict_model(iX,model_dir=None,opt_mode='classification'):
                     return fcl
 
 
-
-
-def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn','loss','spe','sen','acc']):
+def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn','loss','spe','sen','acc'],is_training=False):
     if model_dir==None:
         print("No model to load")
         return
@@ -56,7 +54,7 @@ def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','
                     if x.type == 'Placeholder':
                         if "drop_out" in x.name:
                             dop_dic[x.name+":0"]=1.0
-                fd={'x:0':iX,'y:0':iY,'train_test:0':False}
+                fd={'x:0':iX,'y:0':iY,'train_test:0':is_training}
                 fd.update(dop_dic)
                 if opt_mode=='classification':
                     stats_result = s.run(stats_l,feed_dict=fd)
@@ -68,6 +66,7 @@ def test_model(iX,iY,model_dir=None,opt_mode='classification',stats_list=['tp','
                 elif opt_mode=='regression':
                     lt= s.run('loss:0',feed_dict=fd)
                     print("Loss",lt)
+                    return_dic['MSE']=lt
         return return_dic
 
 def print_progres_train(ix,it,bx,bt,lt):
@@ -145,7 +144,9 @@ def train_model(ix,iy,cv_args,fc_args,itx=None,ity=None,batch_test=False,stddev_
         acc_,spe_,sen_,tp_,tn_,fp_,fn_ = stats_class(y_CNN,y_)
     elif opt_mode=='regression':
         loss = tf.reduce_mean(tf.pow(tf.subtract(y_,FCL),2),name='loss')
-    train_step = tf.train.AdamOptimizer(learning_rate).minimize(loss)    
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    with tf.control_dependencies(update_ops):
+        train_step = tf.train.AdamOptimizer(learning_rate).minimize(loss)
     init_op = tf.global_variables_initializer()
     saver = tf.train.Saver()
     
@@ -238,14 +239,14 @@ def conv(input_matrix,filter_size=3,layer_depth=8,
               is_training=True,name_scope="lx",
               stddev_n = 0.05,
              max_bool=False,max_kernel=[1,2,2,1],max_strides=[1,1,1,1], max_padding='SAME',
-             drop_out_bool=False,drop_out_ph=None,drop_out_v=None
+             drop_out_bool=False,drop_out_ph=None,drop_out_v=None,decay=0.5
              ):
     with tf.name_scope(name_scope):
         input_depth=input_matrix.get_shape().as_list()[3]
         W = tf.Variable(tf.truncated_normal([filter_size,filter_size,input_depth,layer_depth], stddev=stddev_n),name='W')
         b = tf.Variable(tf.constant(stddev_n, shape=[layer_depth]),name='b')
         c = tf.nn.conv2d(input_matrix, W, strides=strides, padding=padding,name='conv') + b
-        n = tf.contrib.layers.batch_norm(c, center=True, scale=True, is_training=is_training)
+        n = tf.contrib.layers.batch_norm(c, center=True, scale=True, is_training=is_training,decay=decay)
         a = tf.nn.relu(n,name="activation")
         if max_bool==True:
             out = tf.nn.max_pool(a, ksize=max_kernel,strides=max_strides, padding=max_padding,name='max')
@@ -260,7 +261,7 @@ def conv(input_matrix,filter_size=3,layer_depth=8,
 
 def fc(input_matrix,n=22,norm=False,prev_conv=False,
        stddev_n = 0.05,is_training=True,
-       name_scope='FC',drop_out_bool=False,drop_out_ph=None,drop_out_v=None):
+       name_scope='FC',drop_out_bool=False,drop_out_ph=None,drop_out_v=None,decay=0.5):
     with tf.name_scope(name_scope):
         cvpfx = get_previous_features(input_matrix)
         if prev_conv==True:
@@ -274,7 +275,7 @@ def fc(input_matrix,n=22,norm=False,prev_conv=False,
             out_ = fc
         else:
             if norm==True:
-                n = tf.contrib.layers.batch_norm(fc, center=True, scale=True, is_training=is_training)
+                n = tf.contrib.layers.batch_norm(fc, center=True, scale=True, is_training=is_training,decay=decay)
                 out = tf.nn.relu(n,name="activation")
             else:
                 out = tf.nn.relu(fc,name="activation")
@@ -324,7 +325,7 @@ def send_mail(email_origin,email_destination,email_pass,subject="Test report",co
     msg = "Subject:"+subject+" \n\n "+content+"\n" # The /n separates the message from the headers
     server.sendmail(email_origin,email_destination, msg)
 
-def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn']):
+def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classification',stats_list=['tp','tn','fp','fn'],is_training=False):
     xts = iX.shape[0]
     bs = xts//batch_size
     stats_l = []
@@ -334,7 +335,7 @@ def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classificat
         bb1 = (1+_)*batch_size
         bx = iX[bb:bb1,:,:,:]
         by = iY[bb:bb1,:]
-        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list)
+        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list,is_training=is_training)
         stats_l.append(stats_dic)
     if bs*batch_size<xts:
         print(str(_+1)+"/"+str(bs))
@@ -342,14 +343,15 @@ def test_model_by_batch(iX,iY,batch_size=16,model_dir=None,opt_mode='classificat
         bb1 = xts
         bx = iX[bb:bb1,:,:,:]
         by = iY[bb:bb1,:]
-        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list)
+        stats_dic = test_model(iX=bx,iY=by,model_dir=model_dir,opt_mode=opt_mode,stats_list=stats_list,is_training=is_training)
         stats_l.append(stats_dic)
     stats_df = pd.DataFrame(stats_l)
-    stats_dic = stats_df.sum().to_dict()
     if opt_mode=='classification':
+        stats_dic = stats_df.sum().to_dict()
         ac_se_sp = acc_sen_spe(**stats_dic)
         stats_dic.update(ac_se_sp)
-
+    elif opt_mode=='regression':
+        stats_dic = stats_df.mean().to_dict()
     return stats_dic
 
 def binary_balance_positive_negative(iNp,iBatchSize=256,v=False,reshape_x=(256,256,1)):
